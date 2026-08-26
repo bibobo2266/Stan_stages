@@ -21,6 +21,7 @@ VOL_MULT = 1.5           # breakout volume vs 10-week avg
 RS_WEEKS = 13            # relative strength lookback
 RANGE_WEEKS = 52         # window for "where in the range" (Stage 3 vs turning)
 TOP_ZONE = 0.60          # above MA + flat/falling MA: >=this = real top, below = turning
+ENTRY_STAGES = (2, 1)    # timing/accumulation filters apply here only — never to 3/4
 RS_EXEMPT = {"2330", "2317", "2454", "2308", "2382"}  # index heavyweights: RS vs an index they dominate is meaningless
 MA_DAYS = 6              # daily entry filter: close > 6-day MA
 DMI_LEN = 14             # daily DMI length
@@ -300,15 +301,16 @@ with st.sidebar:
     rank_by = st.selectbox(
         "掃描範圍", ["大型股優先", "代號順序"],
         help="大型股優先=先掃約120檔法人愛的大中型股。")
-    want_stages = st.multiselect("顯示階段", [2, 1, 3, 4], default=[2, 4],
+    want_stages = st.multiselect("顯示階段", [2, 1, 3, 4], default=[2, 1, 3, 4],
                                  format_func=lambda s: STAGE_META[s][0])
     st.divider()
     mkt_gate = st.checkbox("大盤 Stage 4 時不顯示 Stage 2", value=True,
                            help="Weinstein 原則：大盤走空時不做多。")
-    need_ma6 = st.checkbox("只留 收盤 > 6日均", value=False)
-    need_di = st.checkbox("只留 DI+ > DI-", value=False)
+    entry_gate = st.checkbox("進場擇時濾網（收盤>6日均 且 DI+>DI-）", value=True,
+                             help="只套用在 上升 / 打底 名單。頭部 / 下跌 是出場名單，"
+                                  "永遠不套用——跌破均線的股票本來就 DI- 佔優，套了會全空。")
     inst_only = st.checkbox("只留法人近3月淨買", value=False,
-                            help="過濾掉法人沒買的。台股法人主導。")
+                            help="同樣只套用在 上升 / 打底。會多打一輪 API，慢很多。")
     max_scan = st.slider("掃描檔數上限", 30, 400, len(BIGCAP), 1,
                          help=f"大型股清單只有 {len(BIGCAP)} 檔；超過就是按代號補進來的雜訊。"
                               "開法人過濾會再多打一輪 API。")
@@ -377,12 +379,12 @@ if go:
             if gate_on and stage == 2:
                 continue
             sig = daily_signals(px)
-            if need_ma6 and sig["ma6"] is not True:
-                continue
-            if need_di and not (sig["di_gap"] is not None and sig["di_gap"] > 0):
-                continue
-            if inst_only and inst_netbuy(token, r.stock_id, inst_start) <= 0:
-                continue
+            entryable = sig["ma6"] is True and sig["di_gap"] is not None and sig["di_gap"] > 0
+            if stage in ENTRY_STAGES:
+                if entry_gate and not entryable:
+                    continue
+                if inst_only and inst_netbuy(token, r.stock_id, inst_start) <= 0:
+                    continue
             rows.append(dict(代號=r.stock_id, 名稱=r.stock_name, _stage=stage,
                              收盤=d["price"], MA30W=d["ma"], RS=d["rs"],
                              乖離=d["bias"], 區間位置=d["pos"], 突破前高=d["breakout"],
@@ -396,6 +398,8 @@ if go:
 
     if gate_on:
         st.warning("大盤處於 Stage 4，已隱藏 Stage 2 名單。要看的話取消左側勾選。")
+    if entry_gate:
+        st.caption("擇時濾網已套用在 上升／打底；頭部／下跌 為完整名單，未過濾。")
 
     if not rows:
         st.info("這批沒有符合的標的。放寬條件或提高掃描檔數再試。")
@@ -455,6 +459,14 @@ if go:
                            file_name=f"stage_{stage_tag}_{dt.date.today().isoformat()}.csv",
                            mime="text/csv", key=f"dl{s}")
 
+    st.divider()
+    all_csv = df.assign(階段=df["_stage"].map(lambda x: STAGE_META[x][0].split()[0])) \
+                .drop(columns="_stage").to_csv(index=False).encode("utf-8-sig")
+    st.download_button("下載全部（四階段合併一個檔）", all_csv,
+                       file_name=f"stage_all_{dt.date.today().isoformat()}.csv",
+                       mime="text/csv", key="dlall", type="primary",
+                       use_container_width=True)
+
     st.caption("僅供研究，非投資建議。TradingView / 券商 App 覆核後再下單。")
 else:
     st.markdown("← 左側設定條件，按 **開始掃描**。")
@@ -464,6 +476,7 @@ else:
     站上但均線未上彎：在52週區間高檔({int(TOP_ZONE*100)}%以上)算頭部，低檔算<b>轉折</b>。<br>
     <b>Stage 2 加看</b>　突破前6週高點、量 > 10週均量×{VOL_MULT}、RS vs 加權。<br>
     <b>進場擇時（日線，不影響階段）</b>　收盤 > {MA_DAYS}日均、DMI({DMI_LEN}) DI+ > DI-。<br>
+    此濾網<b>只套用在 上升／打底</b>；頭部／下跌 一律給完整名單。跑一次四張表都是對的設定。<br>
     <b>大盤濾網</b>　大盤 Stage 4 時預設不出 Stage 2 名單。<br>
     <b>排序</b>　Stage 2 以「突破前高+爆量」優先，其次才是 RS。<br>
     權值前五（2330/2317/2454/2308/2382）豁免 RS&lt;0 過濾——它們本身就是指數。<br>
