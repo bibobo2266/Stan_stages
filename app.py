@@ -21,6 +21,7 @@ VOL_MULT = 1.5           # breakout volume vs 10-week avg
 RS_WEEKS = 13            # relative strength lookback
 RANGE_WEEKS = 52         # window for "where in the range" (Stage 3 vs turning)
 TOP_ZONE = 0.60          # above MA + flat/falling MA: >=this = real top, below = turning
+RS_EXEMPT = {"2330", "2317", "2454", "2308", "2382"}  # index heavyweights: RS vs an index they dominate is meaningless
 MA_DAYS = 6              # daily entry filter: close > 6-day MA
 DMI_LEN = 14             # daily DMI length
 LOOKBACK_DAYS = 560      # ~80 weekly bars: 30w MA + 52w range + buffer
@@ -254,9 +255,12 @@ def classify(w: pd.DataFrame, bench_w: pd.Series):
     else:
         stage, note = 1, "回檔"      # below MA but MA still rising
 
+    bias = (price / ma_now - 1) * 100 if ma_now else 0.0   # 乖離率 vs 30W MA
+
     detail = dict(price=round(price, 2), ma=round(ma_now, 2),
                   above=above, slope_up=slope_up, breakout=breakout,
                   vol_surge=vol_surge, pos=round(pos * 100),
+                  bias=round(bias, 1),
                   rs=None if rs is None else round(rs * 100, 1), note=note)
     return stage, detail
 
@@ -305,8 +309,11 @@ with st.sidebar:
     need_di = st.checkbox("只留 DI+ > DI-", value=False)
     inst_only = st.checkbox("只留法人近3月淨買", value=False,
                             help="過濾掉法人沒買的。台股法人主導。")
-    max_scan = st.slider("掃描檔數上限", 30, 400, 120, 10,
-                         help="檔數越多越慢。開法人過濾會再多打一輪 API。")
+    max_scan = st.slider("掃描檔數上限", 30, 400, len(BIGCAP), 1,
+                         help=f"大型股清單只有 {len(BIGCAP)} 檔；超過就是按代號補進來的雜訊。"
+                              "開法人過濾會再多打一輪 API。")
+    if rank_by != "代號順序" and max_scan > len(BIGCAP):
+        st.caption(f"⚠︎ 超過 {len(BIGCAP)} 檔的部分不在大型股清單內。")
     go = st.button("開始掃描", type="primary", use_container_width=True)
 
 if not token:
@@ -378,7 +385,7 @@ if go:
                 continue
             rows.append(dict(代號=r.stock_id, 名稱=r.stock_name, _stage=stage,
                              收盤=d["price"], MA30W=d["ma"], RS=d["rs"],
-                             區間位置=d["pos"], 突破前高=d["breakout"],
+                             乖離=d["bias"], 區間位置=d["pos"], 突破前高=d["breakout"],
                              爆量=d["vol_surge"],
                              MA6=sig["ma6"],
                              DI差=sig["di_gap"],
@@ -397,11 +404,18 @@ if go:
     df = pd.DataFrame(rows)
     # Stage 2 must beat the index: drop laggards (RS<0). Only when RS is trustworthy.
     if matched:
-        df = df[~((df["_stage"] == 2) & (df["RS"].fillna(-1) < 0))]
+        drop = (df["_stage"] == 2) & (df["RS"].fillna(-1) < 0) & \
+               (~df["代號"].isin(RS_EXEMPT))
+        df = df[~drop]
     if df.empty:
         st.info("這批沒有符合的標的。放寬條件或提高掃描檔數再試。")
         st.stop()
-    df = df.sort_values(["_stage", "RS"], ascending=[True, False], na_position="last")
+    # Stage 2: fresh base breakouts first (Weinstein buys the breakout, not the chase).
+    # Everything else stays RS-ranked.
+    df["_setup"] = df["突破前高"].astype(int) + df["爆量"].astype(int)
+    df = df.sort_values(["_stage", "_setup", "RS"],
+                        ascending=[True, False, False], na_position="last") \
+           .drop(columns="_setup")
 
     counts = df["_stage"].value_counts()
     chips = "  ".join(
@@ -428,6 +442,7 @@ if go:
             sub, hide_index=True, use_container_width=True,
             column_config={
                 "RS": st.column_config.NumberColumn("RS%", help=f"vs 加權，{RS_WEEKS}週。正=贏大盤", format="%.1f"),
+                "乖離": st.column_config.NumberColumn("乖離%", help="收盤 vs 30週均線的乖離率。>40% 追高風險高", format="%.1f"),
                 "區間位置": st.column_config.NumberColumn("區間位置", help="在52週高低區間的位置%，0=底 100=頂", format="%d"),
                 "突破前高": st.column_config.CheckboxColumn("突破前高"),
                 "爆量": st.column_config.CheckboxColumn(f"爆量>{VOL_MULT}x"),
@@ -450,6 +465,8 @@ else:
     <b>Stage 2 加看</b>　突破前6週高點、量 > 10週均量×{VOL_MULT}、RS vs 加權。<br>
     <b>進場擇時（日線，不影響階段）</b>　收盤 > {MA_DAYS}日均、DMI({DMI_LEN}) DI+ > DI-。<br>
     <b>大盤濾網</b>　大盤 Stage 4 時預設不出 Stage 2 名單。<br>
+    <b>排序</b>　Stage 2 以「突破前高+爆量」優先，其次才是 RS。<br>
+    權值前五（2330/2317/2454/2308/2382）豁免 RS&lt;0 過濾——它們本身就是指數。<br>
     未收盤的當週一律排除，所有數字都以最後一根完整週線為準。
     </div>
     """, unsafe_allow_html=True)
