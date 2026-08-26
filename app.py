@@ -9,6 +9,7 @@ Setup:
 """
 
 import datetime as dt
+import os
 import pandas as pd
 import streamlit as st
 from FinMind.data import DataLoader
@@ -21,6 +22,7 @@ VOL_MULT = 1.5           # breakout volume vs 10-week avg
 RS_WEEKS = 13            # relative strength lookback
 RANGE_WEEKS = 52         # window for "where in the range" (Stage 3 vs turning)
 TOP_ZONE = 0.60          # above MA + flat/falling MA: >=this = real top, below = turning
+SNAP_DIR = "snapshots"   # best-effort local history; Streamlit Cloud may wipe it on reboot
 ENTRY_STAGES = (2, 1)    # timing/accumulation filters apply here only — never to 3/4
 RS_EXEMPT = {"2330", "2317", "2454", "2308", "2382"}  # index heavyweights: RS vs an index they dominate is meaningless
 MA_DAYS = 6              # daily entry filter: close > 6-day MA
@@ -276,6 +278,67 @@ def market_stage(bench_daily: pd.Series):
     return stage
 
 
+# ------------------------------------------------------------------ snapshots
+STAGE_SHORT = {s: m[0].split()[0] for s, m in STAGE_META.items()}   # 2 -> 上升
+SHORT_STAGE = {v: k for k, v in STAGE_SHORT.items()}
+
+
+def save_snapshot(snap: pd.DataFrame) -> None:
+    """Best-effort. The snapshot records EVERY scanned stock's stage, before any
+    display filter — otherwise last week's filter settings would fake transitions."""
+    try:
+        os.makedirs(SNAP_DIR, exist_ok=True)
+        snap.to_csv(f"{SNAP_DIR}/{dt.date.today().isoformat()}.csv",
+                    index=False, encoding="utf-8-sig")
+    except Exception:
+        pass
+
+
+def read_prev(upload):
+    """Return (DataFrame[代號, 階段碼], label) from an upload or the newest local
+    snapshot. Accepts a snapshot file or any of the app's own output CSVs."""
+    def _norm(p):
+        p = p.copy()
+        p["代號"] = p["代號"].astype(str).str.strip()
+        if "階段碼" in p.columns:
+            p["階段碼"] = pd.to_numeric(p["階段碼"], errors="coerce")
+        elif "階段" in p.columns:
+            p["階段碼"] = p["階段"].astype(str).str.strip().map(SHORT_STAGE)
+        else:
+            return None
+        return p.dropna(subset=["階段碼"])[["代號", "階段碼"]].astype({"階段碼": int})
+
+    if upload is not None:
+        try:
+            return _norm(pd.read_csv(upload)), "上傳檔"
+        except Exception:
+            return None, None
+    try:
+        today = dt.date.today().isoformat()
+        fs = sorted(f[:-4] for f in os.listdir(SNAP_DIR)
+                    if f.endswith(".csv") and f[:-4] != today)
+        if fs:
+            return _norm(pd.read_csv(f"{SNAP_DIR}/{fs[-1]}.csv")), fs[-1]
+    except Exception:
+        pass
+    return None, None
+
+
+def transitions(now: pd.DataFrame, prev: pd.DataFrame) -> pd.Series:
+    """階段轉換 label per 代號. All 12 transitions, plus 新進榜 for unseen tickers."""
+    pmap = dict(zip(prev["代號"], prev["階段碼"]))
+    out = {}
+    for sid, cur in zip(now["代號"], now["階段碼"]):
+        old = pmap.get(sid)
+        if old is None:
+            out[sid] = "新進榜"
+        elif old == cur:
+            out[sid] = ""
+        else:
+            out[sid] = f"{STAGE_SHORT[old]}→{STAGE_SHORT[cur]}"
+    return out
+
+
 # ------------------------------------------------------------------ ui
 st.markdown("""
 <style>
@@ -311,6 +374,9 @@ with st.sidebar:
                                   "永遠不套用——跌破均線的股票本來就 DI- 佔優，套了會全空。")
     inst_only = st.checkbox("只留法人近3月淨買", value=False,
                             help="同樣只套用在 上升 / 打底。會多打一輪 API，慢很多。")
+    prev_up = st.file_uploader("上週快照（選填，用來比對階段轉換）", type="csv",
+                               help="上傳上週下載的『本週快照』或任一階段 CSV。"
+                                    "沒上傳的話會自動找伺服器上最近一次的紀錄。")
     max_scan = st.slider("掃描檔數上限", 30, 400, len(BIGCAP), 1,
                          help=f"大型股清單只有 {len(BIGCAP)} 檔；超過就是按代號補進來的雜訊。"
                               "開法人過濾會再多打一輪 API。")
@@ -364,7 +430,8 @@ if go:
 
     gate_on = bool(mkt_gate and mstage == 4 and 2 in want_stages)
 
-    rows, partial_hits, prog = [], 0, st.progress(0.0, text="掃描中…")
+    rows, snap_rows, partial_hits = [], [], 0
+    prog = st.progress(0.0, text="掃描中…")
     for i, (_, r) in enumerate(pool.iterrows(), 1):
         prog.progress(i / len(pool), text=f"掃描中… {r.stock_id} {r.stock_name}")
         try:
@@ -374,7 +441,12 @@ if go:
             w, partial = weekly(px)
             partial_hits += int(partial)
             stage, d = classify(w, bench_w)
-            if stage is None or stage not in want_stages:
+            if stage is None:
+                continue
+            # snapshot first: record the stage of EVERY stock we could classify,
+            # independent of 顯示階段 / 濾網 — otherwise next week's diff is garbage.
+            snap_rows.append(dict(代號=r.stock_id, 名稱=r.stock_name, 階段碼=stage))
+            if stage not in want_stages:
                 continue
             if gate_on and stage == 2:
                 continue
@@ -395,6 +467,11 @@ if go:
         except Exception:
             continue
     prog.empty()
+
+    snap = pd.DataFrame(snap_rows)
+    if not snap.empty:
+        save_snapshot(snap)
+    prev, prev_lab = read_prev(prev_up)
 
     if gate_on:
         st.warning("大盤處於 Stage 4，已隱藏 Stage 2 名單。要看的話取消左側勾選。")
@@ -420,6 +497,30 @@ if go:
     df = df.sort_values(["_stage", "_setup", "RS"],
                         ascending=[True, False, False], na_position="last") \
            .drop(columns="_setup")
+
+    # 階段轉換
+    if prev is not None and not prev.empty:
+        tmap = transitions(snap.assign(代號=snap["代號"].astype(str)), prev)
+        df.insert(2, "轉換", df["代號"].astype(str).map(tmap).fillna(""))
+        chg = snap.assign(轉換=snap["代號"].astype(str).map(tmap)) \
+                  .query("轉換 != '' and 轉換 == 轉換")
+        chg = chg[chg["轉換"] != "新進榜"]
+        st.markdown(f"### 階段轉換　<span class=\"muted\">vs {prev_lab}</span>",
+                    unsafe_allow_html=True)
+        if chg.empty:
+            st.caption("本週沒有任何股票換階段。")
+        else:
+            chg = chg.assign(_o=chg["轉換"].str[:2].map(SHORT_STAGE)) \
+                     .sort_values(["_o", "轉換"]).drop(columns=["_o", "階段碼"])
+            st.dataframe(chg, hide_index=True, use_container_width=True)
+            st.caption("打底→上升 是最值得注意的買進訊號；上升→頭部／上升→下跌 是出場訊號。")
+            st.download_button("下載 轉換 CSV",
+                               chg.to_csv(index=False).encode("utf-8-sig"),
+                               file_name=f"transitions_{dt.date.today().isoformat()}.csv",
+                               mime="text/csv", key="dlchg")
+    else:
+        st.info("沒有可比對的上週資料 — 這次的結果會存成快照，下週再跑就會顯示階段轉換。"
+                "請記得下載下方的「本週快照」保存。")
 
     counts = df["_stage"].value_counts()
     chips = "  ".join(
@@ -462,6 +563,13 @@ if go:
     st.divider()
     all_csv = df.assign(階段=df["_stage"].map(lambda x: STAGE_META[x][0].split()[0])) \
                 .drop(columns="_stage").to_csv(index=False).encode("utf-8-sig")
+    if not snap.empty:
+        st.download_button("下載 本週快照（下週比對用，請保存）",
+                           snap.assign(階段=snap["階段碼"].map(STAGE_SHORT))
+                               .to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"snapshot_{dt.date.today().isoformat()}.csv",
+                           mime="text/csv", key="dlsnap", use_container_width=True)
+
     st.download_button("下載全部（四階段合併一個檔）", all_csv,
                        file_name=f"stage_all_{dt.date.today().isoformat()}.csv",
                        mime="text/csv", key="dlall", type="primary",
@@ -477,6 +585,8 @@ else:
     <b>Stage 2 加看</b>　突破前6週高點、量 > 10週均量×{VOL_MULT}、RS vs 加權。<br>
     <b>進場擇時（日線，不影響階段）</b>　收盤 > {MA_DAYS}日均、DMI({DMI_LEN}) DI+ > DI-。<br>
     此濾網<b>只套用在 上升／打底</b>；頭部／下跌 一律給完整名單。跑一次四張表都是對的設定。<br>
+    <b>階段轉換</b>　每次掃描都會存下全部個股的階段快照；下週再跑就會比對出誰換了階段。<br>
+    快照記的是<b>未經任何濾網</b>的階段，所以改設定不會製造假訊號。<br>
     <b>大盤濾網</b>　大盤 Stage 4 時預設不出 Stage 2 名單。<br>
     <b>排序</b>　Stage 2 以「突破前高+爆量」優先，其次才是 RS。<br>
     權值前五（2330/2317/2454/2308/2382）豁免 RS&lt;0 過濾——它們本身就是指數。<br>
