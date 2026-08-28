@@ -1,4 +1,5 @@
-streamlit
-FinMind
-pandas
-numpy
+streamlit>=1.30
+pandas<3
+numpy<3
+requests
+pyarrow
