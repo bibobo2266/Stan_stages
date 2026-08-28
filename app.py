@@ -1,595 +1,226 @@
 """
-Weinstein 4-Stage Scanner — Taiwan stocks & ETFs
-Single-file Streamlit app. Deploy free on Streamlit Cloud.
+Weinstein 四階段掃描器 — 台股
 
-Setup:
-  1. Get a free token at https://finmindtrade.com  (Login > API Token)
-  2. Put it in Streamlit secrets as FINMIND_TOKEN (or paste in the sidebar)
-  3. requirements.txt  ->  streamlit\nFinMind\npandas
+v2 — 資料改讀 minervini_picks 的 data/prices.parquet（全市場，每日 17:00 自動更新）
+     母體從硬編大型股清單改成流動性門檻；階段快照改由 GitHub Actions 每週
+     commit 進 repo，「階段轉換」不再需要手動下載／上傳。
+
+這支 app 的位置：抓第一階段 → 第二階段的轉折，以及大盤環境。
+Minervini 的趨勢模板有四條在確認「已經是第二階段」，所以它結構上撈不到
+這一段。兩者互補，不是重複。
 """
-
 import datetime as dt
-import os
-import pandas as pd
-import streamlit as st
-from FinMind.data import DataLoader
+import io
 
-# ------------------------------------------------------------------ config
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
+
+import stages_core as S
+
 st.set_page_config(page_title="階段掃描 · Stage Scanner", page_icon="◧", layout="wide")
 
-MA_WEEKS = 30            # Weinstein's 30-week MA
-VOL_MULT = 1.5           # breakout volume vs 10-week avg
-RS_WEEKS = 13            # relative strength lookback
-RANGE_WEEKS = 52         # window for "where in the range" (Stage 3 vs turning)
-TOP_ZONE = 0.60          # above MA + flat/falling MA: >=this = real top, below = turning
-SNAP_DIR = "snapshots"   # best-effort local history; Streamlit Cloud may wipe it on reboot
-ENTRY_STAGES = (2, 1)    # timing/accumulation filters apply here only — never to 3/4
-RS_EXEMPT = {"2330", "2317", "2454", "2308", "2382"}  # index heavyweights: RS vs an index they dominate is meaningless
-MA_DAYS = 6              # daily entry filter: close > 6-day MA
-DMI_LEN = 14             # daily DMI length
-LOOKBACK_DAYS = 560      # ~80 weekly bars: 30w MA + 52w range + buffer
-INST_DAYS = 90           # institutional net-buy window (the label says 3 months)
+SELF_REPO = "bibobo2266/Stan_stages"
+STAGES_URL = f"https://raw.githubusercontent.com/{SELF_REPO}/main/data/stages.parquet"
 
 STAGE_META = {
-    2: ("上升 Advancing", "買 / 觀察", "#1f9d55", "站上30週線、均線上彎、放量突破。錢在這裡賺。"),
-    1: ("打底 Basing",    "觀望",     "#8a8f98", "橫盤、量縮，聰明錢吸貨。含剛翻多的轉折股，等轉2。"),
-    3: ("頭部 Topping",   "減碼",     "#d9a441", "高檔震盪、量大不漲。出貨警訊。"),
+    2: ("上升 Advancing", "買 / 觀察", "#1f9d55", "站上30週線、均線上彎。錢在這裡賺。"),
+    1: ("打底 Basing", "觀望 / 轉折可佈局", "#8a8f98", "橫盤、量縮，聰明錢吸貨。含剛翻多的轉折股。"),
+    3: ("頭部 Topping", "減碼", "#d9a441", "高檔震盪、量大不漲。出貨警訊。"),
     4: ("下跌 Declining", "避開 / 出", "#d9534f", "跌破30週線、均線下彎。錢在這裡賠。"),
 }
 
-# ------------------------------------------------------------------ data
-def _api(token: str) -> DataLoader:
-    api = DataLoader()
-    api.login_by_token(api_token=token)
-    return api
+
+@st.cache_data(ttl=60 * 60 * 4, show_spinner="讀取行情資料…")
+def build(liq: float):
+    P, uni = S.load_frames(min_wan=liq)
+    idx = S.market_index(P)
+    W, partial = S.weekly(P, idx)
+    d = S.classify(W)
+    d = d.join(S.extras(P)).join(S.ma_turn_weeks(W["c"]).rename("翻揚週"))
+    d = d.join(uni[["stock_name", "industry_category"]])
+    d = d.rename(columns={"stock_name": "名稱", "industry_category": "產業"})
+    ms, mbias = S.market_stage(idx)
+    return d, ms, mbias, W["c"].index[-1].date(), partial, P["c"].shape[1]
 
 
-@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
-def load_universe(token: str) -> pd.DataFrame:
-    api = _api(token)
-    df = api.taiwan_stock_info()
-    return df[["stock_id", "stock_name", "type", "industry_category"]].drop_duplicates("stock_id")
-
-
-@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
-def price_mode(token: str) -> str:
-    """Probe once: 'adj' if adjusted (dividend-restored) prices are available, else 'raw'.
-
-    This decides which benchmark we may fairly compare against — mixing raw prices
-    with a total-return index understates every stock during dividend season.
-    """
-    api = _api(token)
-    probe = (dt.date.today() - dt.timedelta(days=40)).isoformat()
+@st.cache_data(ttl=60 * 60 * 4, show_spinner=False)
+def load_history():
     try:
-        df = api.taiwan_stock_daily_adj(stock_id="2330", start_date=probe)
-        if not df.empty:
-            return "adj"
+        r = requests.get(STAGES_URL, timeout=60)
+        r.raise_for_status()
+        h = pd.read_parquet(io.BytesIO(r.content))
+        return h.sort_values(["week", "stock_id"])
     except Exception:
-        pass
-    return "raw"
+        return pd.DataFrame()
 
 
-@st.cache_data(ttl=60 * 60 * 3, show_spinner=False)
-def load_prices(token: str, sid: str, start: str, mode: str) -> pd.DataFrame:
-    api = _api(token)
-    df = pd.DataFrame()
-    if mode == "adj":
-        try:
-            df = api.taiwan_stock_daily_adj(stock_id=sid, start_date=start)
-        except Exception:
-            df = pd.DataFrame()
-    if df.empty:
-        df = api.taiwan_stock_daily(stock_id=sid, start_date=start)
-    if df.empty:
-        return df
-    df["date"] = pd.to_datetime(df["date"])
-    return df.set_index("date").sort_index()
-
-
-@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
-def inst_netbuy(token: str, sid: str, start: str) -> float:
-    """Net institutional buy (shares) over the period. >0 = accumulating."""
-    api = _api(token)
-    try:
-        df = api.taiwan_stock_institutional_investors(stock_id=sid, start_date=start)
-    except Exception:
-        return 0.0
-    if df.empty:
-        return 0.0
-    return float(df["buy"].sum() - df["sell"].sum())
-
-
-@st.cache_data(ttl=60 * 60 * 3, show_spinner=False)
-def load_benchmark(token: str, start: str, mode: str):
-    """TAIEX daily close + a label. Matched to `mode` so RS is apples-to-apples.
-
-    adj stock prices -> total-return index;  raw stock prices -> price index.
-    Returns (Series, label, matched).
-    """
-    api = _api(token)
-
-    def _tr():
-        df = api.taiwan_stock_total_return_index(index_id="TAIEX", start_date=start)
-        if df.empty:
-            return None
-        df["date"] = pd.to_datetime(df["date"])
-        return df.set_index("date").sort_index()["price"]
-
-    def _px():
-        df = api.taiwan_stock_daily(stock_id="TAIEX", start_date=start)
-        if df.empty:
-            return None
-        df["date"] = pd.to_datetime(df["date"])
-        return df.set_index("date").sort_index()["close"]
-
-    first, second = (_tr, _px) if mode == "adj" else (_px, _tr)
-    labels = ("報酬指數", "價格指數") if mode == "adj" else ("價格指數", "報酬指數")
-    for fn, lab, matched in ((first, labels[0], True), (second, labels[1], False)):
-        try:
-            s = fn()
-        except Exception:
-            s = None
-        if s is not None and not s.empty:
-            return s, lab, matched
-    return pd.Series(dtype=float), "無", False
-
-
-# Big/mid-cap priority list (verified real tickers, ≈cap order).
-BIGCAP = [
-    "2330","2317","2454","2308","2382","2891","2412","2303","2881","3711",
-    "2882","2886","1216","2884","2357","3034","2892","2885","2890","3231",
-    "2345","2379","2603","3037","2880","5880","2887","2883","1303","2002",
-    "1301","2327","3008","2395","3045","4938","2409","2301","2408","6505",
-    "5871","2207","1101","2618","2610","2615","9910","2801","2823","2474",
-    "6669","3661","3017","2376","2356","2360","3702","2385","6415","3005",
-    "2377","4904","2337","6446","1476","2049","1590","9945","2542","2455",
-    "2353","3443","2451","8046","2324","6488","3533","5269","2368","3653",
-    "2347","2344","2371","3529","2492","2312","1102","2404","1802","9917",
-    "2809","2812","6412","3406","2439","2201","1326","2105","2633","2354",
-    "2338","3260","2504","4958","3019","8210","2481","6213","1229","2231",
-    "1503","3044",
-]
-
-
-@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
-def load_ranking() -> pd.DataFrame:
-    """Static big-cap priority list; rank = position."""
-    return pd.DataFrame({"stock_id": BIGCAP,
-                         "market_value": list(range(len(BIGCAP), 0, -1))})
-
-
-# ------------------------------------------------------------------ logic
-def weekly(df: pd.DataFrame):
-    """Daily -> weekly OHLCV (Fri close). Drops the still-running week.
-
-    A partial week has partial volume, so leaving it in makes 爆量 almost
-    always False and 突破前高 read off a half-formed bar.
-    Returns (weekly_df, dropped_partial).
-    """
-    o = df["open"].resample("W-FRI").first()
-    h = df["max"].resample("W-FRI").max()
-    l = df["min"].resample("W-FRI").min()
-    c = df["close"].resample("W-FRI").last()
-    v = df["Trading_Volume"].resample("W-FRI").sum()
-    w = pd.DataFrame({"o": o, "h": h, "l": l, "c": c, "v": v}).dropna()
-    if w.empty:
-        return w, False
-    label = w.index[-1].date()          # that week's Friday
-    last_data = df.index[-1].date()
-    today = dt.date.today()
-    # incomplete only if the week's Friday hasn't happened yet (or is today,
-    # pre-close). A Friday holiday leaves label > last_data but label < today.
-    partial = label > last_data and label >= today
-    if partial:
-        w = w.iloc[:-1]
-    return w, partial
-
-
-def dmi(df: pd.DataFrame, n: int = DMI_LEN):
-    """Wilder DI+/DI- on daily bars."""
-    h, l, c = df["max"], df["min"], df["close"]
-    up, dn = h.diff(), -l.diff()
-    plus_dm = up.where((up > dn) & (up > 0), 0.0).fillna(0.0)
-    minus_dm = dn.where((dn > up) & (dn > 0), 0.0).fillna(0.0)
-    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()],
-                   axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1 / n, adjust=False).mean()
-    pdi = 100 * plus_dm.ewm(alpha=1 / n, adjust=False).mean() / atr
-    mdi = 100 * minus_dm.ewm(alpha=1 / n, adjust=False).mean() / atr
-    return pdi, mdi
-
-
-def daily_signals(px: pd.DataFrame) -> dict:
-    """Timing filters on the daily chart. Deliberately kept out of classify():
-    the stage is a weekly judgement, these only say 'is this week entryable'."""
-    out = dict(ma6=None, di_gap=None)
-    if len(px) < max(MA_DAYS, DMI_LEN * 3) + 5:
-        return out
-    ma6 = px["close"].rolling(MA_DAYS).mean().iloc[-1]
-    pdi, mdi = dmi(px)
-    out["ma6"] = bool(px["close"].iloc[-1] > ma6)
-    out["di_gap"] = round(float(pdi.iloc[-1] - mdi.iloc[-1]), 1)
-    return out
-
-
-def classify(w: pd.DataFrame, bench_w: pd.Series):
-    """Return (stage, detail) or (None, None) if not enough data."""
-    if len(w) < MA_WEEKS + 5:
-        return None, None
-    ma = w["c"].rolling(MA_WEEKS).mean()
-    price = float(w["c"].iloc[-1])
-    ma_now = float(ma.iloc[-1])
-    slope = float(ma.diff(4).iloc[-1])       # 4-week slope of the MA
-    above = price > ma_now
-    slope_up = slope > 0
-    slope_dn = slope < 0
-
-    # breakout: last completed week's close above the prior 6 weeks' high, on volume
-    prior_high = w["h"].iloc[-7:-1].max()
-    vol_avg = w["v"].iloc[-11:-1].mean()
-    breakout = bool(price > prior_high)
-    vol_surge = bool(w["v"].iloc[-1] > VOL_MULT * vol_avg)
-
-    # where in the 52-week range — separates a real top from a fresh turn
-    n = min(len(w), RANGE_WEEKS)
-    hi, lo = float(w["h"].iloc[-n:].max()), float(w["l"].iloc[-n:].min())
-    pos = (price - lo) / (hi - lo) if hi > lo else 0.5
-
-    # relative strength vs the benchmark
-    rs = None
-    if bench_w is not None and len(bench_w) > RS_WEEKS + 1:
-        j = w.join(bench_w.rename("bm"), how="inner")
-        if len(j) > RS_WEEKS + 1:
-            k = -(RS_WEEKS + 1)
-            rs = (j["c"].iloc[-1] / j["c"].iloc[k] - 1) - (j["bm"].iloc[-1] / j["bm"].iloc[k] - 1)
-
-    note = ""
-    if above and slope_up:
-        stage = 2
-    elif not above and slope_dn:
-        stage = 4
-    elif above and not slope_up:
-        # price reclaimed the MA but the MA hasn't turned up yet.
-        # High in the range = distribution. Low in the range = 1->2 turn.
-        if pos >= TOP_ZONE:
-            stage = 3
-        else:
-            stage, note = 1, "轉折"
-    else:
-        stage, note = 1, "回檔"      # below MA but MA still rising
-
-    bias = (price / ma_now - 1) * 100 if ma_now else 0.0   # 乖離率 vs 30W MA
-
-    detail = dict(price=round(price, 2), ma=round(ma_now, 2),
-                  above=above, slope_up=slope_up, breakout=breakout,
-                  vol_surge=vol_surge, pos=round(pos * 100),
-                  bias=round(bias, 1),
-                  rs=None if rs is None else round(rs * 100, 1), note=note)
-    return stage, detail
-
-
-def market_stage(bench_daily: pd.Series):
-    """Run the same stage logic on the index itself."""
-    if bench_daily is None or bench_daily.empty:
-        return None
-    c = bench_daily.resample("W-FRI").last().dropna()
-    w = pd.DataFrame({"o": c, "h": c, "l": c, "c": c, "v": 1.0})
-    stage, _ = classify(w, None)
-    return stage
-
-
-# ------------------------------------------------------------------ snapshots
-STAGE_SHORT = {s: m[0].split()[0] for s, m in STAGE_META.items()}   # 2 -> 上升
-SHORT_STAGE = {v: k for k, v in STAGE_SHORT.items()}
-
-
-def save_snapshot(snap: pd.DataFrame) -> None:
-    """Best-effort. The snapshot records EVERY scanned stock's stage, before any
-    display filter — otherwise last week's filter settings would fake transitions."""
-    try:
-        os.makedirs(SNAP_DIR, exist_ok=True)
-        snap.to_csv(f"{SNAP_DIR}/{dt.date.today().isoformat()}.csv",
-                    index=False, encoding="utf-8-sig")
-    except Exception:
-        pass
-
-
-def read_prev(upload):
-    """Return (DataFrame[代號, 階段碼], label) from an upload or the newest local
-    snapshot. Accepts a snapshot file or any of the app's own output CSVs."""
-    def _norm(p):
-        p = p.copy()
-        p["代號"] = p["代號"].astype(str).str.strip()
-        if "階段碼" in p.columns:
-            p["階段碼"] = pd.to_numeric(p["階段碼"], errors="coerce")
-        elif "階段" in p.columns:
-            p["階段碼"] = p["階段"].astype(str).str.strip().map(SHORT_STAGE)
-        else:
-            return None
-        return p.dropna(subset=["階段碼"])[["代號", "階段碼"]].astype({"階段碼": int})
-
-    if upload is not None:
-        try:
-            return _norm(pd.read_csv(upload)), "上傳檔"
-        except Exception:
-            return None, None
-    try:
-        today = dt.date.today().isoformat()
-        fs = sorted(f[:-4] for f in os.listdir(SNAP_DIR)
-                    if f.endswith(".csv") and f[:-4] != today)
-        if fs:
-            return _norm(pd.read_csv(f"{SNAP_DIR}/{fs[-1]}.csv")), fs[-1]
-    except Exception:
-        pass
-    return None, None
-
-
-def transitions(now: pd.DataFrame, prev: pd.DataFrame) -> pd.Series:
-    """階段轉換 label per 代號. All 12 transitions, plus 新進榜 for unseen tickers."""
-    pmap = dict(zip(prev["代號"], prev["階段碼"]))
-    out = {}
-    for sid, cur in zip(now["代號"], now["階段碼"]):
-        old = pmap.get(sid)
-        if old is None:
-            out[sid] = "新進榜"
-        elif old == cur:
-            out[sid] = ""
-        else:
-            out[sid] = f"{STAGE_SHORT[old]}→{STAGE_SHORT[cur]}"
-    return out
-
-
-# ------------------------------------------------------------------ ui
 st.markdown("""
 <style>
-  .block-container {padding-top: 2.2rem; max-width: 1100px;}
-  h1 {font-weight: 700; letter-spacing:-.5px;}
-  .pill {display:inline-block;padding:2px 10px;border-radius:999px;
-         font-size:.78rem;font-weight:600;color:#fff;}
-  .muted {color:#8a8f98;font-size:.85rem;}
-  div[data-testid="stMetricValue"] {font-size:1.4rem;}
+.block-container {padding-top: 2.2rem; max-width: 1150px;}
+h1 {font-weight:700; letter-spacing:-.5px;}
+.pill {display:inline-block;padding:2px 10px;border-radius:999px;
+       font-size:.78rem;font-weight:600;color:#fff;}
+.muted {color:#8a8f98;font-size:.85rem;}
 </style>
 """, unsafe_allow_html=True)
 
 st.title("階段掃描器")
-st.markdown('<span class="muted">Weinstein 四階段 · 台股 / ETF · 週線判斷</span>',
-            unsafe_allow_html=True)
+st.markdown('<span class="muted">Weinstein 四階段 · 全市場週線判斷 · '
+            '抓第一階段→第二階段的轉折</span>', unsafe_allow_html=True)
 
 with st.sidebar:
     st.subheader("設定")
-    token = st.text_input("FinMind Token", type="password",
-                          value=st.secrets.get("FINMIND_TOKEN", ""),
-                          help="免費申請：finmindtrade.com")
-    asset = st.radio("標的", ["股票", "ETF"], horizontal=True)
-    rank_by = st.selectbox(
-        "掃描範圍", ["大型股優先", "代號順序"],
-        help="大型股優先=先掃約120檔法人愛的大中型股。")
-    want_stages = st.multiselect("顯示階段", [2, 1, 3, 4], default=[2, 1, 3, 4],
-                                 format_func=lambda s: STAGE_META[s][0])
+    liq = st.number_input("60日均額門檻（萬元）", 500, 100000, 5000, 500,
+                          help="流動性過濾。第一階段的股票天生冷門，"
+                               "用成交值排行取樣會全部漏掉。")
+    want = st.multiselect("顯示階段", [2, 1, 3, 4], default=[1, 2],
+                          format_func=lambda s: STAGE_META[s][0])
     st.divider()
-    mkt_gate = st.checkbox("大盤 Stage 4 時不顯示 Stage 2", value=True,
+    mkt_gate = st.checkbox("大盤 Stage 4 時隱藏 Stage 2", value=True,
                            help="Weinstein 原則：大盤走空時不做多。")
-    entry_gate = st.checkbox("進場擇時濾網（收盤>6日均 且 DI+>DI-）", value=True,
-                             help="只套用在 上升 / 打底 名單。頭部 / 下跌 是出場名單，"
-                                  "永遠不套用——跌破均線的股票本來就 DI- 佔優，套了會全空。")
-    inst_only = st.checkbox("只留法人近3月淨買", value=False,
-                            help="同樣只套用在 上升 / 打底。會多打一輪 API，慢很多。")
-    prev_up = st.file_uploader("上週快照（選填，用來比對階段轉換）", type="csv",
-                               help="上傳上週下載的『本週快照』或任一階段 CSV。"
-                                    "沒上傳的話會自動找伺服器上最近一次的紀錄。")
-    max_scan = st.slider("掃描檔數上限", 30, 400, len(BIGCAP), 1,
-                         help=f"大型股清單只有 {len(BIGCAP)} 檔；超過就是按代號補進來的雜訊。"
-                              "開法人過濾會再多打一輪 API。")
-    if rank_by != "代號順序" and max_scan > len(BIGCAP):
-        st.caption(f"⚠︎ 超過 {len(BIGCAP)} 檔的部分不在大型股清單內。")
+    turn_only = st.checkbox("打底區只看「轉折」", value=True,
+                            help="轉折＝站回30週線但均線未上彎、且在52週區間低檔。"
+                                 "這是第一階段末端，最早的進場點。")
+    max_turn = st.slider("均線翻揚倒數上限（週）", 0, 21, 8,
+                         help="扣抵值算出來的：價格持平下，30週均線還要幾週"
+                              "才會由平轉揚。0 = 已經上彎。21 = 不限。")
+    min_rs = st.slider("最低 RS%（vs 等權市場）", -30, 30, 0)
     go = st.button("開始掃描", type="primary", use_container_width=True)
 
-if not token:
-    st.info("在左側填入 FinMind Token 後即可開始。免費申請：finmindtrade.com")
+if not go:
+    st.info("← 左側設定後按「開始掃描」。資料每個交易日 17:00 自動更新，掃描約 5 秒。")
+    st.markdown("""
+<div class="muted">
+<b>階段判斷（週線）</b> 收盤 vs 30週均線 + 均線 4 週斜率。<br>
+站上但均線未上彎：52週區間 60% 以上算頭部，以下算<b>轉折</b>（第一階段末端）。<br>
+<b>RS</b> vs 等權市場指數（母體每日報酬算術平均）。用等權而不是市值加權，
+是因為市值加權會被權值股主導，RS 就變成「有沒有贏台積電」。<br>
+<b>翻揚週</b> 扣抵值算的：假設價格持平，均線還要幾週由平轉揚。這是確定性的
+未來資訊——即將滾出視窗的舊 K 棒已經寫好了。<br>
+<b>階段轉換</b> GitHub Actions 每週自動存快照並 commit，不需手動上傳。<br>
+<b>注意</b> parquet 是未還原股價，除息旺季個股會有除息缺口；但 RS 的基準也是
+同一批未還原價格算出來的，偏誤大致互相抵消。
+</div>
+""", unsafe_allow_html=True)
     st.stop()
 
-if not want_stages:
-    st.warning("請至少選一個階段。")
-    st.stop()
+d, ms, mbias, wk, partial, pool_n = build(liq)
 
-# ------------------------------------------------------------------ run
-if go:
-    start = (dt.date.today() - dt.timedelta(days=LOOKBACK_DAYS)).isoformat()
-    inst_start = (dt.date.today() - dt.timedelta(days=INST_DAYS)).isoformat()
-    try:
-        mode = price_mode(token)
-        uni = load_universe(token)
-    except Exception as e:
-        st.error(f"讀取股票清單失敗：{e}. 檢查 Token 是否正確。")
-        st.stop()
+# ---- 大盤橫幅 ----
+if ms:
+    mn, ma_, mc, _ = STAGE_META[ms]
+    st.markdown(f'大盤 <span class="pill" style="background:{mc}">{mn}</span> '
+                f'<span class="muted">乖離 {mbias:+.1f}% · 建議 {ma_}</span>',
+                unsafe_allow_html=True)
+gate_on = bool(mkt_gate and ms == 4 and 2 in want)
+if gate_on:
+    st.warning("大盤處於 Stage 4，已隱藏 Stage 2 名單。要看的話取消左側勾選。")
 
-    is_etf = uni["type"].str.contains("etf|ETF", case=False, na=False) | \
-             uni["stock_id"].str.match(r"^00\d{2,4}")
-    pool = uni[is_etf] if asset == "ETF" else uni[~is_etf]
-    pool = pool[pool["stock_id"].str.match(r"^\d{4,6}$")]
+st.caption(f"母體 {pool_n} 檔 · 週線收盤 {wk} · "
+           f"{'已排除未完成的當週' if partial else '當週已收盤'}")
 
-    if rank_by != "代號順序":
-        rk = load_ranking()
-        pool = pool.merge(rk, on="stock_id", how="left") \
-                   .sort_values("market_value", ascending=False, na_position="last")
+# ---- 階段轉換（自動，不需上傳）----
+hist = load_history()
+if not hist.empty and hist["week"].nunique() >= 2:
+    weeks = sorted(hist["week"].astype(str).unique())
+    cur, prev = weeks[-1], weeks[-2]
+    a = hist[hist["week"].astype(str) == prev].set_index("stock_id")["stage"]
+    b = hist[hist["week"].astype(str) == cur].set_index("stock_id")["stage"]
+    j = pd.concat([a.rename("舊"), b.rename("新")], axis=1).dropna()
+    chg = j[j["舊"] != j["新"]].copy()
+    chg["轉換"] = (chg["舊"].astype(int).map(S.STAGE_NAME) + "→"
+                 + chg["新"].astype(int).map(S.STAGE_NAME))
+    chg = chg.join(d[["名稱", "產業", "收盤", "RS%"]])
 
-    pool = pool.head(max_scan)
-
-    bench_d, bench_lab, matched = load_benchmark(token, start, mode)
-    bench_w = bench_d.resample("W-FRI").last().dropna() if not bench_d.empty else pd.Series(dtype=float)
-    mstage = market_stage(bench_d)
-
-    # market banner
-    if mstage:
-        mn, ma_, mc, _ = STAGE_META[mstage]
-        st.markdown(f'大盤　<span class="pill" style="background:{mc}">{mn}</span>',
-                    unsafe_allow_html=True)
-    if not matched:
-        st.warning(f"RS 基準用的是 {bench_lab}，與 {'還原' if mode == 'adj' else '未還原'}"
-                   f"股價不同基準 — 除息旺季 RS 會偏低，請當參考值看。")
-
-    gate_on = bool(mkt_gate and mstage == 4 and 2 in want_stages)
-
-    rows, snap_rows, partial_hits = [], [], 0
-    prog = st.progress(0.0, text="掃描中…")
-    for i, (_, r) in enumerate(pool.iterrows(), 1):
-        prog.progress(i / len(pool), text=f"掃描中… {r.stock_id} {r.stock_name}")
-        try:
-            px = load_prices(token, r.stock_id, start, mode)
-            if px.empty:
-                continue
-            w, partial = weekly(px)
-            partial_hits += int(partial)
-            stage, d = classify(w, bench_w)
-            if stage is None:
-                continue
-            # snapshot first: record the stage of EVERY stock we could classify,
-            # independent of 顯示階段 / 濾網 — otherwise next week's diff is garbage.
-            snap_rows.append(dict(代號=r.stock_id, 名稱=r.stock_name, 階段碼=stage))
-            if stage not in want_stages:
-                continue
-            if gate_on and stage == 2:
-                continue
-            sig = daily_signals(px)
-            entryable = sig["ma6"] is True and sig["di_gap"] is not None and sig["di_gap"] > 0
-            if stage in ENTRY_STAGES:
-                if entry_gate and not entryable:
-                    continue
-                if inst_only and inst_netbuy(token, r.stock_id, inst_start) <= 0:
-                    continue
-            rows.append(dict(代號=r.stock_id, 名稱=r.stock_name, _stage=stage,
-                             收盤=d["price"], MA30W=d["ma"], RS=d["rs"],
-                             乖離=d["bias"], 區間位置=d["pos"], 突破前高=d["breakout"],
-                             爆量=d["vol_surge"],
-                             MA6=sig["ma6"],
-                             DI差=sig["di_gap"],
-                             註記=d["note"]))
-        except Exception:
-            continue
-    prog.empty()
-
-    snap = pd.DataFrame(snap_rows)
-    if not snap.empty:
-        save_snapshot(snap)
-    prev, prev_lab = read_prev(prev_up)
-
-    if gate_on:
-        st.warning("大盤處於 Stage 4，已隱藏 Stage 2 名單。要看的話取消左側勾選。")
-    if entry_gate:
-        st.caption("擇時濾網已套用在 上升／打底；頭部／下跌 為完整名單，未過濾。")
-
-    if not rows:
-        st.info("這批沒有符合的標的。放寬條件或提高掃描檔數再試。")
-        st.stop()
-
-    df = pd.DataFrame(rows)
-    # Stage 2 must beat the index: drop laggards (RS<0). Only when RS is trustworthy.
-    if matched:
-        drop = (df["_stage"] == 2) & (df["RS"].fillna(-1) < 0) & \
-               (~df["代號"].isin(RS_EXEMPT))
-        df = df[~drop]
-    if df.empty:
-        st.info("這批沒有符合的標的。放寬條件或提高掃描檔數再試。")
-        st.stop()
-    # Stage 2: fresh base breakouts first (Weinstein buys the breakout, not the chase).
-    # Everything else stays RS-ranked.
-    df["_setup"] = df["突破前高"].astype(int) + df["爆量"].astype(int)
-    df = df.sort_values(["_stage", "_setup", "RS"],
-                        ascending=[True, False, False], na_position="last") \
-           .drop(columns="_setup")
-
-    # 階段轉換
-    if prev is not None and not prev.empty:
-        tmap = transitions(snap.assign(代號=snap["代號"].astype(str)), prev)
-        df.insert(2, "轉換", df["代號"].astype(str).map(tmap).fillna(""))
-        chg = snap.assign(轉換=snap["代號"].astype(str).map(tmap)) \
-                  .query("轉換 != '' and 轉換 == 轉換")
-        chg = chg[chg["轉換"] != "新進榜"]
-        st.markdown(f"### 階段轉換　<span class=\"muted\">vs {prev_lab}</span>",
-                    unsafe_allow_html=True)
-        if chg.empty:
-            st.caption("本週沒有任何股票換階段。")
-        else:
-            chg = chg.assign(_o=chg["轉換"].str[:2].map(SHORT_STAGE)) \
-                     .sort_values(["_o", "轉換"]).drop(columns=["_o", "階段碼"])
-            st.dataframe(chg, hide_index=True, use_container_width=True)
-            st.caption("打底→上升 是最值得注意的買進訊號；上升→頭部／上升→下跌 是出場訊號。")
-            st.download_button("下載 轉換 CSV",
-                               chg.to_csv(index=False).encode("utf-8-sig"),
-                               file_name=f"transitions_{dt.date.today().isoformat()}.csv",
-                               mime="text/csv", key="dlchg")
-    else:
-        st.info("沒有可比對的上週資料 — 這次的結果會存成快照，下週再跑就會顯示階段轉換。"
-                "請記得下載下方的「本週快照」保存。")
-
-    counts = df["_stage"].value_counts()
-    chips = "  ".join(
-        f'<span class="pill" style="background:{STAGE_META[s][2]}">'
-        f'{STAGE_META[s][0].split()[0]} {counts.get(s,0)}</span>'
-        for s in [2, 3, 1, 4] if s in want_stages)
-    st.markdown(chips, unsafe_allow_html=True)
-    bar = "已排除未完成的本週" if partial_hits else "本週已收盤"
-    st.caption(f"掃描 {len(pool)} 檔 · 命中 {len(df)} 檔 · {bar} · "
-               f"股價{'還原' if mode == 'adj' else '未還原'} · RS基準 {bench_lab} · "
-               f"{dt.date.today():%Y-%m-%d}")
-
-    for s in [2, 3, 1, 4]:
-        if s not in want_stages:
-            continue
-        sub = df[df["_stage"] == s].drop(columns="_stage")
-        if sub.empty:
-            continue
-        name, action, color, note = STAGE_META[s]
-        stage_tag = name.split()[0]
-        st.markdown(f"### {name} · **{action}**")
-        st.caption(note)
-        st.dataframe(
-            sub, hide_index=True, use_container_width=True,
-            column_config={
-                "RS": st.column_config.NumberColumn("RS%", help=f"vs 加權，{RS_WEEKS}週。正=贏大盤", format="%.1f"),
-                "乖離": st.column_config.NumberColumn("乖離%", help="收盤 vs 30週均線的乖離率。>40% 追高風險高", format="%.1f"),
-                "區間位置": st.column_config.NumberColumn("區間位置", help="在52週高低區間的位置%，0=底 100=頂", format="%d"),
-                "突破前高": st.column_config.CheckboxColumn("突破前高"),
-                "爆量": st.column_config.CheckboxColumn(f"爆量>{VOL_MULT}x"),
-                "MA6": st.column_config.CheckboxColumn("C>MA6", help="日線：收盤 > 6日均"),
-                "DI差": st.column_config.NumberColumn("DI+−DI-", help="日線 DMI(14)。正=多方掌控", format="%.1f"),
-                "註記": st.column_config.TextColumn("註記", help="轉折=剛站上均線但均線未上彎；回檔=跌破均線但均線仍上彎"),
-            })
-        csv = sub.assign(階段=stage_tag).to_csv(index=False).encode("utf-8-sig")
-        st.download_button(f"下載 {stage_tag} CSV", csv,
-                           file_name=f"stage_{stage_tag}_{dt.date.today().isoformat()}.csv",
-                           mime="text/csv", key=f"dl{s}")
-
-    st.divider()
-    all_csv = df.assign(階段=df["_stage"].map(lambda x: STAGE_META[x][0].split()[0])) \
-                .drop(columns="_stage").to_csv(index=False).encode("utf-8-sig")
-    if not snap.empty:
-        st.download_button("下載 本週快照（下週比對用，請保存）",
-                           snap.assign(階段=snap["階段碼"].map(STAGE_SHORT))
-                               .to_csv(index=False).encode("utf-8-sig"),
-                           file_name=f"snapshot_{dt.date.today().isoformat()}.csv",
-                           mime="text/csv", key="dlsnap", use_container_width=True)
-
-    st.download_button("下載全部（四階段合併一個檔）", all_csv,
-                       file_name=f"stage_all_{dt.date.today().isoformat()}.csv",
-                       mime="text/csv", key="dlall", type="primary",
-                       use_container_width=True)
-
-    st.caption("僅供研究，非投資建議。TradingView / 券商 App 覆核後再下單。")
+    st.markdown(f"### 階段轉換 <span class='muted'>{prev} → {cur}</span>",
+                unsafe_allow_html=True)
+    key = chg[chg["轉換"] == "打底→上升"]
+    c1, c2 = st.columns([1, 3])
+    c1.metric("🚀 打底→上升", len(key), help="最值得注意的買進訊號")
+    c2.metric("⛔ 上升→頭部／下跌",
+              int(chg["轉換"].isin(["上升→頭部", "上升→下跌"]).sum()),
+              help="出場訊號")
+    st.dataframe(chg.reset_index()[["stock_id", "名稱", "轉換", "收盤", "RS%", "產業"]],
+                 hide_index=True, use_container_width=True, height=260)
 else:
-    st.markdown("← 左側設定條件，按 **開始掃描**。")
-    st.markdown(f"""
-    <div class="muted">
-    <b>階段判斷（週線）</b>　收盤 vs {MA_WEEKS}週均線 + 均線方向。<br>
-    站上但均線未上彎：在52週區間高檔({int(TOP_ZONE*100)}%以上)算頭部，低檔算<b>轉折</b>。<br>
-    <b>Stage 2 加看</b>　突破前6週高點、量 > 10週均量×{VOL_MULT}、RS vs 加權。<br>
-    <b>進場擇時（日線，不影響階段）</b>　收盤 > {MA_DAYS}日均、DMI({DMI_LEN}) DI+ > DI-。<br>
-    此濾網<b>只套用在 上升／打底</b>；頭部／下跌 一律給完整名單。跑一次四張表都是對的設定。<br>
-    <b>階段轉換</b>　每次掃描都會存下全部個股的階段快照；下週再跑就會比對出誰換了階段。<br>
-    快照記的是<b>未經任何濾網</b>的階段，所以改設定不會製造假訊號。<br>
-    <b>大盤濾網</b>　大盤 Stage 4 時預設不出 Stage 2 名單。<br>
-    <b>排序</b>　Stage 2 以「突破前高+爆量」優先，其次才是 RS。<br>
-    權值前五（2330/2317/2454/2308/2382）豁免 RS&lt;0 過濾——它們本身就是指數。<br>
-    未收盤的當週一律排除，所有數字都以最後一根完整週線為準。
-    </div>
-    """, unsafe_allow_html=True)
+    st.info("階段轉換需要至少兩週的歷史快照。Actions 每週會自動累積，"
+            "第二週開始就會出現。")
+
+# ---- 名單 ----
+st.divider()
+for s in [1, 2, 3, 4]:
+    if s not in want or (gate_on and s == 2):
+        continue
+    sub = d[d["階段"] == s].copy()
+    if s == 1 and turn_only:
+        sub = sub[sub["註記"] == "轉折"]
+    if s in (1, 2):
+        sub = sub[(sub["RS%"] >= min_rs) & (sub["翻揚週"] <= max_turn)]
+    if sub.empty:
+        continue
+
+    name, action, color, note = STAGE_META[s]
+    st.markdown(f"### {name} · **{action}** <span class='muted'>{len(sub)} 檔</span>",
+                unsafe_allow_html=True)
+    st.caption(note)
+
+    sub = sub.sort_values(["翻揚週", "RS%"], ascending=[True, False]) if s == 1 \
+        else sub.sort_values(["突破前高", "爆量", "RS%"], ascending=False)
+    cols = ["名稱", "產業", "收盤", "MA30W", "RS%", "乖離%", "區間位置",
+            "打底週", "量能比", "RS改善", "翻揚週", "突破前高", "爆量", "均額億"]
+    st.dataframe(sub[cols].reset_index(), hide_index=True, use_container_width=True,
+                 height=min(460, 60 + 35 * len(sub)), column_config={
+        "RS%": st.column_config.NumberColumn("RS%", format="%.1f",
+            help="vs 等權市場指數，13週。正=贏市場"),
+        "乖離%": st.column_config.NumberColumn("乖離%", format="%.1f"),
+        "區間位置": st.column_config.NumberColumn("區間位置", format="%d",
+            help="52週高低區間位置，0=底 100=頂"),
+        "打底週": st.column_config.NumberColumn("打底週", format="%d",
+            help="振幅維持在 35% 以內已持續幾週。越久，突破時爆發力越強"),
+        "量能比": st.column_config.NumberColumn("量能比", format="%.2f",
+            help="近20日均量 / 近120日均量。<1 = 量能乾涸，第一階段末端的特徵"),
+        "RS改善": st.column_config.NumberColumn("RS改善", format="%.0f",
+            help="RS 百分位近三個月的變化。重點不是 RS 高，是排名正在爬"),
+        "翻揚週": st.column_config.NumberColumn("翻揚週", format="%.0f",
+            help="扣抵值：價格持平下，30週均線還要幾週由平轉揚。0=已上彎"),
+        "突破前高": st.column_config.CheckboxColumn("突破前高"),
+        "爆量": st.column_config.CheckboxColumn(f"爆量>{S.VOL_MULT}x"),
+        "均額億": st.column_config.NumberColumn("均額億", format="%.2f"),
+    })
+    st.text_area("複製代號", " ".join(sub.index.tolist()), height=68, key=f"cp{s}")
+    st.download_button(f"下載 {name.split()[0]} CSV",
+                       sub[cols].reset_index().to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"stage_{s}_{dt.date.today().isoformat()}.csv",
+                       mime="text/csv", key=f"dl{s}")
+    st.divider()
+
+# ---- 轉換訊號的事後驗證 ----
+if not hist.empty and hist["week"].nunique() >= 6:
+    with st.expander("「打底→上升」訊號的事後表現（驗證這個訊號有沒有用）"):
+        weeks = sorted(hist["week"].astype(str).unique())
+        rows = []
+        for i in range(1, len(weeks) - 1):
+            a = hist[hist["week"].astype(str) == weeks[i - 1]].set_index("stock_id")["stage"]
+            b = hist[hist["week"].astype(str) == weeks[i]].set_index("stock_id")
+            hit = b[(b["stage"] == 2) & (b.index.map(a).fillna(0) == 1)]
+            for h in (4, 8, 12):
+                if i + h >= len(weeks):
+                    continue
+                fut = hist[hist["week"].astype(str) == weeks[i + h]].set_index("stock_id")["close"]
+                ov = hit.index.intersection(fut.index)
+                if len(ov) == 0:
+                    continue
+                r = (fut[ov] / hit.loc[ov, "close"] - 1) * 100
+                rows.append({"訊號週": weeks[i], "檔數": len(ov), "之後": f"{h}週",
+                             "中位報酬%": round(float(r.median()), 1),
+                             "勝率%": round(float((r > 0).mean() * 100))})
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+            st.caption("樣本累積越多越有參考價值。若中位報酬長期為負，"
+                       "代表這個訊號在當前市場結構下無效，該調整條件。")
+        else:
+            st.caption("歷史還不夠長，再累積幾週。")
+
+st.caption("僅供研究，非投資建議。")
