@@ -31,6 +31,8 @@ def main():
     idx = S.market_index(P)
     W, partial = S.weekly(P, idx)
     d = S.classify(W)
+    ex = S.extras(P)
+    turn = S.ma_turn_weeks(W["c"])
     ms, mbias = S.market_stage(idx)
 
     week = W["c"].index[-1].date().isoformat()
@@ -49,6 +51,16 @@ def main():
         "ma30w": d["MA30W"].values,
         "rs": d["RS%"].values,
         "pos": d["區間位置"].values,
+        "breakout": d["突破前高"].values,
+        "vol_surge": d["爆量"].values,
+        # 扣抵值：均線翻揚倒數。存這欄是為了日後驗證扣抵值本身有沒有預測力——
+        # 「翻揚週 0~2 的股票，是不是真的比翻揚週 8 以上的先進第二階段」。
+        # 單獨存扣抵值歷史問不出這種問題，掛在有訊號的表上才有意義。
+        "ma_turn_wk": turn.reindex(d.index).values,
+        "base_wk": ex["打底週"].reindex(d.index).values,
+        "vol_ratio": ex["量能比"].reindex(d.index).values,
+        "rs_chg": ex["RS改善"].reindex(d.index).values,
+        "turnover": ex["均額億"].reindex(d.index).values,
         "market_stage": ms,
     })
 
