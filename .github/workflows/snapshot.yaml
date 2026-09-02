@@ -2,11 +2,10 @@ name: Weekly snapshot
 
 # 排程時間避開整點：GitHub 的排程在 :00 最擁擠，負載高時會延遲甚至直接丟掉。
 # 2026-08-31 那次 minervini_picks 的 daily_adj 17:00 首班就是這樣沒觸發。
+# 排程由 cron-job.org 從外部觸發（POST 到 Actions dispatch API）。
+# GitHub 內建的 cron 是 best-effort，實測 2026-09-01 延遲超過 5 小時，
+# 而 workflow_dispatch 走不同佇列，幾乎即時。
 on:
-  schedule:
-    # 週六 01:37 UTC = 台北週六 09:37
-    # 依賴 minervini_picks 的 daily_adj 在週五 17:23 已經把週五收盤寫進去
-    - cron: '37 1 * * 6'
   workflow_dispatch:
 
 permissions:
