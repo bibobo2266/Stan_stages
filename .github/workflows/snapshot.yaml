@@ -2,10 +2,15 @@ name: Weekly snapshot
 
 # 排程時間避開整點：GitHub 的排程在 :00 最擁擠，負載高時會延遲甚至直接丟掉。
 # 2026-08-31 那次 minervini_picks 的 daily_adj 17:00 首班就是這樣沒觸發。
-# 排程由 cron-job.org 從外部觸發（POST 到 Actions dispatch API）。
-# GitHub 內建的 cron 是 best-effort，實測 2026-09-01 延遲超過 5 小時，
-# 而 workflow_dispatch 走不同佇列，幾乎即時。
+# 原本只有 workflow_dispatch，預期由 cron-job.org 外部觸發，但實際上沒設，
+# 所以 2026-08-28 與 2026-09-11 之間整整漏掉一週。加上內建 schedule 當保底：
+# GitHub 內建 cron 是 best-effort（實測 2026-09-01 延遲超過 5 小時），
+# 但週報延遲幾小時無所謂，不像日報卡在盤前。
+# ⚠️ 之後若在 cron-job.org 補了排程，要把下面的 schedule 拿掉，否則一週跑兩次、
+#    週報也會寄兩封（concurrency 擋得掉同時執行，擋不掉先後跑兩次）。
 on:
+  schedule:
+    - cron: '37 1 * * 6'      # 週六 01:37 UTC = 09:37 台北。避開整點。
   workflow_dispatch:
 
 permissions:
