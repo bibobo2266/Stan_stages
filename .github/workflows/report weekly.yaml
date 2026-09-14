@@ -1,0 +1,79 @@
+name: Report - Stan (weekly)
+
+# 放在 Stan_stages 而不是 minervini_picks：
+#   stages.parquet 就在同一個 repo，checkout 完就有。原本放在 minervini_picks
+#   要跨 repo 抓 raw，得留緩衝等對面 commit + raw 快取更新，時間只能用猜的。
+#   串 workflow_run 之後，snapshot 一 commit 完就跑，不用猜。
+#
+# 需要在這個 repo 設三個 secrets（跟 minervini_picks 那邊同名）：
+#   GMAIL_USER / GMAIL_APP_PASSWORD / MAIL_TO
+
+on:
+  workflow_run:
+    workflows: ["Weekly snapshot"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      top:
+        description: '每張表最多列幾檔'
+        default: '20'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: report-weekly
+  cancel-in-progress: false
+
+jobs:
+  report:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # pandas 3.0 的 to_datetime 不再自動推斷混合格式，讀 parquet 的字串
+      # date 欄會 ValueError，所以鎖版本。
+      - run: pip install "pandas<3" "numpy<3" requests pyarrow
+
+      - name: Build report
+        run: python -u scripts/report_stan.py --top ${{ inputs.top || 20 }}
+
+      - name: Collect attachments
+        id: att
+        run: |
+          ls -la out/
+          # 日期在 shell 裡算，YAML 字串裡的 $(date) 不會被展開
+          echo "date=$(date +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+          # 沒有轉換時 CSV 可能不存在，附件清單要動態組，不然 send-mail 會紅掉
+          FILES=$(ls out/*.csv 2>/dev/null | paste -sd, -)
+          echo "files=$FILES" >> "$GITHUB_OUTPUT"
+          # heredoc 的結束符必須自成一行。summary.txt 若結尾沒換行，
+          # 結束符會黏在最後一行上，GitHub 就報 "Matching delimiter not found"。
+          {
+            echo "body<<__MAIL_BODY__"
+            cat out/summary.txt
+            echo ""
+            echo "__MAIL_BODY__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Send mail
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.GMAIL_USER }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          from: Stan Stages <${{ secrets.GMAIL_USER }}>
+          to: ${{ secrets.MAIL_TO }}
+          subject: "Stan 階段週報 ${{ steps.att.outputs.date }}"
+          body: ${{ steps.att.outputs.body }}
+          attachments: ${{ steps.att.outputs.files }}

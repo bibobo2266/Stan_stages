@@ -12,6 +12,11 @@ on:
   schedule:
     - cron: '37 1 * * 6'      # 週六 01:37 UTC = 09:37 台北。避開整點。
   workflow_dispatch:
+    inputs:
+      as_of:
+        description: '回補用：算到哪一天為止（YYYY-MM-DD），留空=最新'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -34,7 +39,12 @@ jobs:
       - run: pip install pandas numpy requests pyarrow
 
       - name: Snapshot stages
-        run: python scripts/snapshot.py
+        run: |
+          if [ -n "${{ inputs.as_of }}" ]; then
+            python scripts/snapshot.py --as-of "${{ inputs.as_of }}"
+          else
+            python scripts/snapshot.py
+          fi
 
       - name: Commit
         run: |
