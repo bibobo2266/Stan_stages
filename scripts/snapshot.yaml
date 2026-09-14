@@ -1,0 +1,65 @@
+name: Weekly snapshot
+
+# 排程時間避開整點：GitHub 的排程在 :00 最擁擠，負載高時會延遲甚至直接丟掉。
+# 2026-08-31 那次 minervini_picks 的 daily_adj 17:00 首班就是這樣沒觸發。
+# 原本只有 workflow_dispatch，預期由 cron-job.org 外部觸發，但實際上沒設，
+# 所以 2026-08-28 與 2026-09-11 之間整整漏掉一週。加上內建 schedule 當保底：
+# GitHub 內建 cron 是 best-effort（實測 2026-09-01 延遲超過 5 小時），
+# 但週報延遲幾小時無所謂，不像日報卡在盤前。
+# ⚠️ 之後若在 cron-job.org 補了排程，要把下面的 schedule 拿掉，否則一週跑兩次、
+#    週報也會寄兩封（concurrency 擋得掉同時執行，擋不掉先後跑兩次）。
+on:
+  schedule:
+    - cron: '37 1 * * 6'      # 週六 01:37 UTC = 09:37 台北。避開整點。
+  workflow_dispatch:
+    inputs:
+      as_of:
+        description: '回補用：算到哪一天為止（YYYY-MM-DD），留空=最新'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: weekly-snapshot
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install pandas numpy requests pyarrow
+
+      - name: Snapshot stages
+        run: |
+          if [ -n "${{ inputs.as_of }}" ]; then
+            python scripts/snapshot.py --as-of "${{ inputs.as_of }}"
+          else
+            python scripts/snapshot.py
+          fi
+
+      - name: Commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git diff --staged --quiet || git commit -m "stages $(date +%Y-%m-%d)"
+          git pull --rebase || true
+          git push
+
+      - name: Report freshness
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          s = pd.read_parquet("data/stages.parquet")
+          col = "date" if "date" in s.columns else s.columns[0]
+          print(f"::notice::stages 最新 {s[col].max()}　{len(s):,} 列")
+          PY
