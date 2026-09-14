@@ -25,9 +25,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--liq", type=float, default=5000, help="60日均額門檻（萬元）")
+    # 回補漏掉的週次用。例：--as-of 2026-09-05 會算到那天為止的週線。
+    # 還原股價是以「今天」為基準往回調整的，但階段判斷全部是比值
+    # （收盤/30週均、RS、區間位置），除權息造成的等比例位移會約分掉，
+    # 所以事後回補跟當週即時計算的結果一致。
+    ap.add_argument("--as-of", dest="as_of", default=None,
+                    help="回溯到某一天為止（YYYY-MM-DD），用來回補漏掉的週")
     args = ap.parse_args()
 
-    P, uni = S.load_frames(min_wan=args.liq)
+    P, uni = S.load_frames(min_wan=args.liq, as_of=args.as_of)
     idx = S.market_index(P)
     W, partial = S.weekly(P, idx)
     d = S.classify(W)
