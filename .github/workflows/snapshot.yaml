@@ -38,7 +38,31 @@ jobs:
 
       - run: pip install pandas numpy requests pyarrow
 
+      # 先單獨確認資料來源讀得到，失敗時直接看到 HTTP 狀態碼，
+      # 不用等 snapshot.py 跑到一半才丟一句「讀不到年份檔」。
+      - name: Check data source
+        env:
+          DATA_TOKEN: ${{ secrets.DATA_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os, requests
+          tok = os.getenv("DATA_TOKEN") or ""
+          h = {"Authorization": f"token {tok}"} if tok else {}
+          base = "https://raw.githubusercontent.com/bibobo2266/minervini_picks/main/data"
+          for name in ["adj/prices_adj_2024.parquet",
+                       "adj/prices_adj_2025.parquet",
+                       "adj/prices_adj_2026.parquet",
+                       "universe.parquet"]:
+              r = requests.head(f"{base}/{name}", headers=h,
+                                allow_redirects=True, timeout=30)
+              size = r.headers.get("content-length", "?")
+              print(f"{r.status_code}  {size:>12}  {name}")
+          print("token:", "有" if tok else "無")
+          PY
+
       - name: Snapshot stages
+        env:
+          DATA_TOKEN: ${{ secrets.DATA_TOKEN }}
         run: |
           if [ -n "${{ inputs.as_of }}" ]; then
             python scripts/snapshot.py --as-of "${{ inputs.as_of }}"
