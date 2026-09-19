@@ -5,6 +5,7 @@ app.py 和 scripts/snapshot.py 都 import 這支，確保畫面上看到的階�
 和存進歷史的階段用完全同一套邏輯。任何一邊自己算都會讓階段轉換失真。
 """
 import io
+import os
 
 import numpy as np
 import pandas as pd
@@ -17,6 +18,10 @@ ADJ_URL = RAW + "/data/adj/prices_adj_{year}.parquet"
 UNIVERSE_URL = RAW + "/data/universe.parquet"
 YEARS_DEFAULT = 3        # 30 週均線 + 52 週區間最多用到一年多
 
+# minervini_picks 若設為 private，raw.githubusercontent.com 會對未授權請求
+# 一律回 404（不是 403），看起來就像檔案不存在。帶 token 才讀得到。
+DATA_TOKEN = os.getenv("DATA_TOKEN") or os.getenv("GH_TOKEN") or ""
+
 MA_WEEKS = 30        # Weinstein 的 30 週均線
 RS_WEEKS = 13        # 相對強度回看
 RANGE_WEEKS = 52     # 52 週高低區間
@@ -27,23 +32,44 @@ STAGE_NAME = {1: "打底", 2: "上升", 3: "頭部", 4: "下跌"}
 
 
 def fetch_parquet(url: str) -> pd.DataFrame:
-    r = requests.get(url, timeout=120)
+    headers = {"Authorization": f"token {DATA_TOKEN}"} if DATA_TOKEN else {}
+    r = requests.get(url, timeout=120, headers=headers)
     r.raise_for_status()
+    # Git LFS 的檔案透過 raw 取回來的是 130 bytes 左右的 pointer 文字檔，
+    # 直接丟進 read_parquet 只會得到看不懂的 ArrowInvalid。先擋下來講清楚。
+    if r.content[:40].startswith(b"version https://git-lfs"):
+        raise RuntimeError("拿到的是 Git LFS pointer，不是真的 parquet")
     return pd.read_parquet(io.BytesIO(r.content))
 
 
 def load_prices(years: int = YEARS_DEFAULT, as_of=None) -> pd.DataFrame:
     """讀還原股價。分年存檔，只載需要的年份——十一年共 169MB，全載會拖垮
-    Streamlit Cloud 的記憶體，而階段判斷最多只用到一年多的歷史。"""
+    Streamlit Cloud 的記憶體，而階段判斷最多只用到一年多的歷史。
+
+    年份檔本來就可能不存在（例如還沒到的年份），所以單一年份失敗不算錯；
+    但三年全滅時要把每一年的真實失敗原因吐出來，否則 Actions 的 log
+    只會看到一句「讀不到任何年份檔」，沒有 HTTP 狀態碼可以查。"""
     end = pd.Timestamp(as_of) if as_of else pd.Timestamp.today()
-    parts = []
+    parts, problems = [], []
     for y in range(end.year - years + 1, end.year + 1):
+        url = ADJ_URL.format(year=y)
         try:
-            parts.append(fetch_parquet(ADJ_URL.format(year=y)))
-        except Exception:
-            pass                              # 該年份檔不存在就跳過
+            parts.append(fetch_parquet(url))
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else "?"
+            problems.append(f"  {y}: HTTP {code}  {url}")
+        except Exception as e:
+            problems.append(f"  {y}: {type(e).__name__}: {e}")
     if not parts:
-        raise RuntimeError("讀不到任何 data/adj/ 年份檔")
+        hint = ("未帶 token —— 若 minervini_picks 是 private repo，"
+                "raw 會一律回 404。請設 DATA_TOKEN 環境變數。"
+                if not DATA_TOKEN else
+                "已帶 token —— 若仍是 404，檢查檔名／分支／token 權限範圍。")
+        raise RuntimeError(
+            "讀不到任何 data/adj/ 年份檔\n"
+            + "\n".join(problems)
+            + f"\n{hint}"
+        )
     df = pd.concat(parts, ignore_index=True)
     df["date"] = pd.to_datetime(df["date"])
     if as_of:
