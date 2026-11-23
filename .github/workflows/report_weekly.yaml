@@ -8,10 +8,8 @@ name: Report - Stan (weekly)
 # 需要在這個 repo 設三個 secrets（跟 minervini_picks 那邊同名）：
 #   GMAIL_USER / GMAIL_APP_PASSWORD / MAIL_TO
 
+# 2026-11-23 Owner：同一週被寄兩次 → 停用 workflow_run 自動觸發，只留 cron-job.org 呼叫的 workflow_dispatch。
 on:
-  workflow_run:
-    workflows: ["Weekly snapshot"]
-    types: [completed]
   workflow_dispatch:
     inputs:
       top:
