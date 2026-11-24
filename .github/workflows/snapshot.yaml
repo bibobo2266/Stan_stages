@@ -9,8 +9,7 @@ name: Weekly snapshot
 # ⚠️ 之後若在 cron-job.org 補了排程，要把下面的 schedule 拿掉，否則一週跑兩次、
 #    週報也會寄兩封（concurrency 擋得掉同時執行，擋不掉先後跑兩次）。
 on:
-  schedule:
-    - cron: '37 1 * * 6'      # 週六 01:37 UTC = 09:37 台北。避開整點。
+  # 2026-11-24 拿掉 GitHub 原生 schedule，改由 cron-job.org 觸發 workflow_dispatch（job 8370047，週六 09:37）
   workflow_dispatch:
     inputs:
       as_of:
