@@ -102,7 +102,9 @@ def _tbl(df, nm, cols, n):
                  f"color:{C['mute']};font-size:13px'>{h}</th>" for h in ["股票"] + [c[1] for c in cols])
     rows = []
     for _, r in df.head(n).iterrows():
-        cells = [f"<b>{_e(r['stock_id'])}</b> {_e(nm.get(r['stock_id'], ''))}"]
+        cells = [f"<b>{_e(r['stock_id'])}</b> {_e(nm.get(r['stock_id'], ''))}" +
+                 (f"<br><span style='font-size:13px;color:{C['red']}'>{_e(r['轉換'])}</span>"
+                  if '轉換' in r.index and isinstance(r['轉換'], str) else "")]
         for key, _lab, kind in cols:
             v = r[key]
             if kind == "pct":
@@ -155,9 +157,8 @@ def write_html(cur, prev, now, mk, dist, tr, bo, st2, nm, top):
         up, nm, [("close", "收盤", "num"), ("rs", "RS", "pct"), ("pos", "區間位置", "pos"),
                  ("base_wk", "打底週數", "int"), ("breakout", "突破", "bool")], top)
     s2 = _h(f"② 掉出上升期：{len(down)} 檔（減碼警示）") + _p(
-        "原本在第 2 期（上升），這週掉到「掉到」欄寫的階段，代表 30 週均線的多頭結構失效。手上有的話，照 Weinstein 的做法是先離場觀望。", True) + _tbl(
-        down.assign(去向=down["stage"].map(lambda x: "→" + NAME[int(x)]) if not down.empty else []),
-        nm, [("去向", "掉到", "str"), ("close", "收盤", "num"), ("rs", "RS", "pct"),
+        "原本在第 2 期（上升），這週掉到其他階段（股票名稱下方寫的就是轉換），代表 30 週均線的多頭結構失效。手上有的話，照 Weinstein 的做法是先離場觀望。", True) + _tbl(
+        down, nm, [("close", "收盤", "num"), ("rs", "RS", "pct"),
                    ("rs_chg", "RS 排名變化", "int")], top)
     s3 = _h(f"③ 上升期且本週突破：{len(bo)} 檔") + _p(
         "已經在第 2 期、這週又創 6 週新高的股票，屬於趨勢延續。", True) + _tbl(
