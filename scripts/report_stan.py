@@ -116,7 +116,7 @@ def _tbl(df, nm, cols, n):
             elif kind == "bool":
                 v = "✓" if bool(v) else ""
             cells.append(_e(v))
-        rows.append("<tr>" + "".join(f"<td style='padding:6px;border-bottom:1px solid {C['line']};font-size:15px'>{c}</td>"
+        rows.append("<tr>" + "".join(f"<td style='padding:6px;border-bottom:1px solid {C['line']};font-size:15px;white-space:nowrap'>{c}</td>"
                                      for c in cells) + "</tr>")
     more = _p(f"只列前 {n} 檔，共 {len(df)} 檔，完整清單在附件 CSV。", True) if len(df) > n else ""
     return f"<table style='border-collapse:collapse;width:100%'><tr>{th}</tr>{''.join(rows)}</table>" + more
@@ -155,8 +155,9 @@ def write_html(cur, prev, now, mk, dist, tr, bo, st2, nm, top):
         up, nm, [("close", "收盤", "num"), ("rs", "RS", "pct"), ("pos", "區間位置", "pos"),
                  ("base_wk", "打底週數", "int"), ("breakout", "突破", "bool")], top)
     s2 = _h(f"② 掉出上升期：{len(down)} 檔（減碼警示）") + _p(
-        "原本在第 2 期，這週掉到其他階段，代表 30 週均線的多頭結構失效。手上有的話，照 Weinstein 的做法是先離場觀望。", True) + _tbl(
-        down, nm, [("轉換", "轉換", "str"), ("close", "收盤", "num"), ("rs", "RS", "pct"),
+        "原本在第 2 期（上升），這週掉到「掉到」欄寫的階段，代表 30 週均線的多頭結構失效。手上有的話，照 Weinstein 的做法是先離場觀望。", True) + _tbl(
+        down.assign(去向=down["stage"].map(lambda x: "→" + NAME[int(x)]) if not down.empty else []),
+        nm, [("去向", "掉到", "str"), ("close", "收盤", "num"), ("rs", "RS", "pct"),
                    ("rs_chg", "RS 排名變化", "int")], top)
     s3 = _h(f"③ 上升期且本週突破：{len(bo)} 檔") + _p(
         "已經在第 2 期、這週又創 6 週新高的股票，屬於趨勢延續。", True) + _tbl(
