@@ -34,7 +34,8 @@ def load_names(ids):
     """股票名稱來自 minervini_picks 的 universe。抓不到就只顯示代號，
     報表不該因為名稱查不到而整份掛掉。"""
     try:
-        u = S.fetch_parquet(S.UNIVERSE_URL)
+        local = os.getenv("STAN_UNIVERSE_FILE", "")
+        u = pd.read_parquet(local) if local and os.path.exists(local) else S.fetch_parquet(S.UNIVERSE_URL)
         u["stock_id"] = u["stock_id"].astype(str)
         return dict(zip(u["stock_id"], u["stock_name"]))
     except Exception as e:
@@ -61,6 +62,130 @@ def fmt(df, nm, cols, n=None):
         out.append(f"| {r['stock_id']} | {nm.get(r['stock_id'], '')} | "
                    + " | ".join(vals) + " |")
     return out
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-24：HTML 版（手機可讀、有敘事）。純文字 summary.txt 保留當備援與稽核。
+C = {"ink": "#1f2937", "mute": "#6b7280", "line": "#e5e7eb", "bg": "#f9fafb",
+     "green": "#047857", "greenbg": "#ecfdf5", "red": "#b91c1c", "redbg": "#fef2f2",
+     "amber": "#92400e", "amberbg": "#fffbeb", "blue": "#1d4ed8", "bluebg": "#eff6ff"}
+MKT_TEXT = {1: "打底：大盤在 30 週均線附近整理，方向還沒出來。",
+            2: "上升：大盤站上往上彎的 30 週均線，順勢做多的環境。",
+            3: "頭部：大盤上漲動能轉弱、均線走平，該收斂、不追高。",
+            4: "下跌：大盤在往下彎的 30 週均線之下，以保本為先。"}
+
+
+def _e(x):
+    import html
+    return html.escape(str(x))
+
+
+def _p(t, small=False):
+    return (f"<p style='margin:4px 0;font-size:{'13px' if small else '15px'};"
+            f"color:{C['mute'] if small else C['ink']};line-height:1.65'>{t}</p>")
+
+
+def _box(title, inner, fg, bg):
+    return (f"<div style='background:{bg};border-left:4px solid {fg};padding:10px 14px;margin:14px 0'>"
+            f"<div style='color:{fg};font-weight:700;margin-bottom:4px'>{title}</div>{inner}</div>")
+
+
+def _h(t):
+    return (f"<h3 style='font-size:18px;margin:24px 0 6px;border-bottom:1px solid {C['line']};"
+            f"padding-bottom:4px'>{t}</h3>")
+
+
+def _tbl(df, nm, cols, n):
+    if df.empty:
+        return _p("（無）")
+    th = "".join(f"<th style='text-align:left;padding:6px;border-bottom:2px solid {C['line']};"
+                 f"color:{C['mute']};font-size:13px'>{h}</th>" for h in ["股票"] + [c[1] for c in cols])
+    rows = []
+    for _, r in df.head(n).iterrows():
+        cells = [f"<b>{_e(r['stock_id'])}</b> {_e(nm.get(r['stock_id'], ''))}"]
+        for key, _lab, kind in cols:
+            v = r[key]
+            if kind == "pct":
+                v = f"{float(v):+.1f}%"
+            elif kind == "pos":
+                v = f"{float(v):.0f}%"
+            elif kind == "num":
+                v = f"{float(v):,.2f}"
+            elif kind == "int":
+                v = f"{int(v)}"
+            elif kind == "bool":
+                v = "✓" if bool(v) else ""
+            cells.append(_e(v))
+        rows.append("<tr>" + "".join(f"<td style='padding:6px;border-bottom:1px solid {C['line']};font-size:15px'>{c}</td>"
+                                     for c in cells) + "</tr>")
+    more = _p(f"只列前 {n} 檔，共 {len(df)} 檔，完整清單在附件 CSV。", True) if len(df) > n else ""
+    return f"<table style='border-collapse:collapse;width:100%'><tr>{th}</tr>{''.join(rows)}</table>" + more
+
+
+def write_html(cur, prev, now, mk, dist, tr, bo, st2, nm, top):
+    total = max(len(now), 1)
+    share = {k: int(dist.get(k, 0)) for k in (1, 2, 3, 4)}
+    up = tr[(tr.prev_stage == 1) & (tr.stage == 2)].sort_values("rs", ascending=False) if not tr.empty else tr
+    down = tr[(tr.prev_stage == 2) & (tr.stage != 2)].sort_values("rs") if not tr.empty else tr
+    head = (f"<div style='font-size:22px;font-weight:700'>Stan 階段週報｜{_e(cur)}</div>"
+            f"<div style='color:{C['mute']};font-size:13px;margin-top:2px'>Weinstein 四階段（以 30 週均線判斷）｜"
+            f"母體 {len(now)} 檔{('｜對比上週 ' + _e(prev)) if prev else ''}</div>")
+    color = {1: (C["amber"], C["amberbg"]), 2: (C["green"], C["greenbg"]),
+             3: (C["amber"], C["amberbg"]), 4: (C["red"], C["redbg"])}.get(mk, (C["mute"], C["bg"]))
+    verdict = _box(f"大盤：第 {mk} 期（{NAME.get(mk, '?')}）", _p(MKT_TEXT.get(mk, "")) + _p(
+        "　".join(f"{k} {NAME[k]} {share[k]} 檔（{share[k] / total * 100:.0f}%）" for k in (1, 2, 3, 4))), *color)
+    def names(df, k=5):
+        return "、".join(f"{r.stock_id} {nm.get(r.stock_id, '')}".strip() for r in df.head(k).itertuples())
+    lead = _box("給忙的你", "".join(_p(x) for x in [
+        f"打底轉上升（進場候選）：<b>{len(up)} 檔</b>" + (f"，RS 最強的是 {_e(names(up))}" if len(up) else "") + "。",
+        f"掉出上升期（減碼警示）：<b>{len(down)} 檔</b>" + (f"，最弱的是 {_e(names(down))}" if len(down) else "") + "。",
+        f"上升期且本週突破：<b>{len(bo)} 檔</b>；目前在上升期的一共 {len(st2)} 檔。",
+    ]), C["blue"], C["bluebg"])
+    concept = _box("先看懂這封信", "".join(_p(x) for x in [
+        "Weinstein 用 30 週均線把一檔股票分成四個階段：<b>1 打底</b>（均線走平、價格在附近盤整）、"
+        "<b>2 上升</b>（價格站上往上彎的均線）、<b>3 頭部</b>（漲不動、均線走平）、<b>4 下跌</b>（跌破往下彎的均線）。"
+        "他的做法很單純：只在第 2 期持有，第 1 期轉第 2 期是最好的進場點，掉出第 2 期就離場觀望。",
+        "<b>RS</b>（相對強度）：過去 13 週這檔的漲跌幅，減掉加權指數同期的漲跌幅。+20% 代表比大盤多漲 20%。",
+        "<b>區間位置</b>：現價落在過去 52 週最低到最高之間的哪裡，0% 是最低點、100% 是最高點。",
+        "<b>打底週數</b>：股價連續幾週都在 35% 的振幅內盤整，打得越久，突破後的行情通常越有份量。",
+        "<b>突破</b>：本週收盤高過前 6 週的最高點。<b>爆量</b>：本週成交量超過前 10 週平均的 1.5 倍。",
+    ]), C["mute"], C["bg"])
+    s1 = _h(f"① 打底 → 上升：{len(up)} 檔（進場候選）") + _p(
+        "剛從盤整區往上走、30 週均線也開始上彎。Weinstein 認為這是風險報酬最好的位置；有爆量突破的更可靠。", True) + _tbl(
+        up, nm, [("close", "收盤", "num"), ("rs", "RS", "pct"), ("pos", "區間位置", "pos"),
+                 ("base_wk", "打底週數", "int"), ("breakout", "突破", "bool")], top)
+    s2 = _h(f"② 掉出上升期：{len(down)} 檔（減碼警示）") + _p(
+        "原本在第 2 期，這週掉到其他階段，代表 30 週均線的多頭結構失效。手上有的話，照 Weinstein 的做法是先離場觀望。", True) + _tbl(
+        down, nm, [("轉換", "轉換", "str"), ("close", "收盤", "num"), ("rs", "RS", "pct"),
+                   ("rs_chg", "RS 排名變化", "int")], top)
+    s3 = _h(f"③ 上升期且本週突破：{len(bo)} 檔") + _p(
+        "已經在第 2 期、這週又創 6 週新高的股票，屬於趨勢延續。", True) + _tbl(
+        bo, nm, [("close", "收盤", "num"), ("rs", "RS", "pct"), ("pos", "區間位置", "pos"),
+                 ("vol_ratio", "量比", "num"), ("vol_surge", "爆量", "bool")], top)
+    s4 = _h(f"④ 上升期強勢榜（RS 前 {top}，共 {len(st2)} 檔）") + _p(
+        "目前在第 2 期、相對大盤最強的股票。「均線上彎週數」0 代表 30 週均線已經往上。", True) + _tbl(
+        st2, nm, [("close", "收盤", "num"), ("rs", "RS", "pct"), ("pos", "區間位置", "pos"),
+                  ("ma_turn_wk", "均線上彎週數", "int")], top)
+    other = tr[~tr.index.isin(up.index) & ~tr.index.isin(down.index)] if not tr.empty else tr
+    s5 = _h(f"⑤ 其餘階段轉換：{len(other)} 檔") + (_p("　".join(
+        f"{_e(r.stock_id)} {_e(nm.get(r.stock_id, ''))}（{_e(r['轉換'])}）" for _, r in other.head(30).iterrows()), True)
+        if len(other) else _p("（無）", True))
+    warn = _box("容易誤讀的地方", "".join(_p(x) for x in [
+        "階段是用週線判斷的，反應比日線慢；一週內的大漲大跌不會馬上改變階段。",
+        "打底轉上升是「候選」，不是買進指令。進場前還要看量能、族群與大盤階段。",
+        "大盤在第 4 期（下跌）時，個股的打底轉上升失敗率會明顯變高。",
+    ]), C["amber"], C["amberbg"])
+    secret = _box("我沒有告訴你的事", "".join(_p(x) for x in [
+        "這份週報只描述狀態，沒有附回測勝率；四階段的判斷規則是照 Weinstein 原典寫成程式，沒有用歷史資料調參數。",
+        "母體是我們整理過的股票清單，不是全市場。",
+    ]), C["red"], C["redbg"])
+    foot = _p(f"資料：Stan_stages／stages.parquet，快照週 {_e(cur)}。僅供研究參考，不構成投資建議。", True)
+    page = (head + verdict + lead + concept + s1 + s2 + s3 + s4 + s5 + warn + secret + foot)
+    html_doc = ("<!DOCTYPE html><html lang='zh-Hant'><head><meta charset='utf-8'></head>"
+                f"<body style='font-family:-apple-system,\"PingFang TC\",\"Noto Sans TC\",sans-serif;color:{C['ink']};"
+                f"max-width:760px;margin:0 auto;padding:12px'>{page}</body></html>")
+    with open(f"{OUT}/summary.html", "w", encoding="utf-8") as f:
+        f.write(html_doc)
 
 
 def main():
@@ -159,6 +284,7 @@ def main():
           "階段定義：1 打底、2 上升、3 頭部、4 下跌（Weinstein 30 週均線）"]
 
     body = "\n".join(L)
+    write_html(cur, prev, now, mk, dist, tr if prev is not None else pd.DataFrame(), bo, st2, nm, args.top)
     with open(f"{OUT}/summary.txt", "w") as f:
         f.write(body.rstrip() + "\n")
     if not tr.empty:
